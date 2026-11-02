@@ -1,8 +1,9 @@
 [package]
 name = "php-verdict"
-version = "5.0.0"
-edition = "2021"
-description = "Multi-signal PHP malware verdict engine (Rust port of php-verdict.py v4)"
+version = "6.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Multi-signal PHP malware verdict engine (signatures, taint, constant folding, polyglot detection, statistics)"
 
 [dependencies]
 regex = "1"

@@ -22,6 +22,7 @@
 //! Usage:  php-verdict FILE...            one line per finding: LEVEL score file :: reasons
 //!         php-verdict --json FILE...
 //!         php-verdict --all FILE...      include CLEAN files
+//!         php-verdict --explain FILE...  per-rule score breakdown + evidence lines + metrics (multi-line)
 //!         php-verdict --stdin            read NUL- or newline-separated paths from stdin
 //!         php-verdict --threads N        cap worker threads (default: all cores)
 
@@ -81,7 +82,10 @@ static EXCLUDE_PATH: LazyLock<Regex> = LazyLock::new(|| {
         r"|/vendor(_prefixed)?/symfony/polyfill-[^/]+/Resources/", // Unicode tables
         r"|/voku/portable-ascii/[^/]*/data/",
         r"|/jwhennessey/phpinsight/",
-        r"|/wp-content/wflogs/",                            // Wordfence config = 1.6MB base64 blob
+        // Wordfence's OWN wflogs files only (config = 1.6MB base64 blob, rules = attack sigs as
+        // data). The whole dir used to be skipped and highway23 had an uploader planted as
+        // wflogs/config-wflog.php (found 2026-11-02) - any other name in there is scanned.
+        r"|/wflogs/(?:attack-data|config|config-livewaf|config-synced|config-transient|ips|rules|template|knownfiles|wafRules)\.php$",
         r"|/wp-includes/ID3/",                              // the only WP-core hex-escape FPs
         r"|/wp-includes/sodium_compat/",                    // lowest-IC WP-core files
         r"|/tcpdf/fonts/",                                  // 1.1M-char single lines
@@ -110,7 +114,6 @@ static EXCLUDE_PATH: LazyLock<Regex> = LazyLock::new(|| {
         r"|/iocs\.json$|/quarantine-inventory\.txt$",     // our own IOC stores hold these literals
         r"|/administrator/components/com_htprotect/",       // Joomla security ext = signature DB
         r"|/tmp/install_[0-9a-f]+/",                        // Joomla installer temp
-        r"|/wflogs/",                                       // Wordfence WAF log/ruleset dir = attack sigs as data
         // PHPUnit tests bundled into WP-Optimize / Perfmatters that ini_set() disable_functions /
         // open_basedir as part of their own assertions - not a sandbox escape.
         r"|/vendor/(?:matthiasmullie/minify|rosell-dk/exec-with-fallback)/[Tt]ests?/",
@@ -688,6 +691,66 @@ fn reassembled_sink(text: &str) -> Option<String> {
     }
     None
 }
+include!("fold.rs");
+// Polyglot: PHP behind a binary/archive header. aonang icon-box.svg.php (2025-08, found
+// 2026-11-02) opened with a fake ZIP local-file header so every text heuristic saw "binary";
+// no legit .php in a web tree starts with non-text bytes before its first tag.
+fn binary_prefix(raw: &[u8]) -> Option<(usize, bool)> {
+    // only a real open tag counts: "<?php", "<?=" or "<? " - random binary often contains "<?"
+    let k = raw.windows(5).position(|w| w == b"<?php" || w.starts_with(b"<?=") || w.starts_with(b"<? "))?;
+    if k == 0 {
+        return None;
+    }
+    let pre = &raw[..k.min(4096)];
+    let magic = [&b"PK\x03\x04"[..], b"\x89PNG", b"GIF8", b"\xff\xd8\xff", b"%PDF", b"\x1f\x8b"];
+    // khamsakaesaeng s1.php: a JPEG header that went through a UTF-8 re-encode (c3bf c398 ...),
+    // so match the format markers inside the first bytes too
+    let head = &pre[..pre.len().min(96)];
+    let marker = [&b"JFIF"[..], b"Exif", b"ICC_PROFILE", b"PNG\r\n", b"IHDR", b"GIF89a", b"GIF87a"];
+    let has_magic = magic.iter().any(|m| raw.starts_with(m)) || marker.iter().any(|m| head.windows(m.len()).any(|w| w == *m));
+    let ctl = pre.iter().filter(|&&c| c < 9 || (13 < c && c < 32) || c == 127).count();
+    (has_magic || ctl > 8).then_some((k, has_magic))
+}
+// Upload straight to the client-chosen file name: copy/move_uploaded_file($_FILES[x]['tmp_name'],
+// ...$_FILES[x]['name']) with nothing but concatenation between - the uploader core of every
+// "upl" mini-shell. Bad-but-honest code does this too, hence SUSPECT alone.
+static RAW_NAME_UPLOAD: LazyLock<Regex> = LazyLock::new(|| {
+    rx(r#"(?i)\b(?:copy|move_uploaded_file)\s*\(\s*\$_FILES\s*\[[^\]]{1,40}\]\s*\[\s*['"]tmp_name['"]\s*\]\s*,[^;(),]{0,80}?\$_FILES\s*\[[^\]]{1,40}\]\s*\[\s*['"]name['"]\s*\]\s*\)"#)
+});
+// crot.jpg.php (khamsakaesaeng 2026-04): $Array = ['7068705f756e616d65', '6368646972', ...] then
+// hex2bin() at the call site - every name the shell uses is a bare hex literal, so nothing folds.
+// Decode each hex-only literal and count distinct dangerous function names.
+static HEX_LIT: LazyLock<Regex> = LazyLock::new(|| rx(r#"['"]((?:[0-9a-fA-F]{2}){4,40})['"]"#));
+const HEX_TABLE_NAMES: &[&str] = &[
+    "php_uname", "phpversion", "chdir", "getcwd", "file_get_contents", "file_put_contents", "base64_decode",
+    "unlink", "mkdir", "chmod", "scandir", "rename", "fopen", "fwrite", "is_writable", "move_uploaded_file",
+    "copy", "touch", "rmdir", "posix_getpwuid", "posix_getgrgid", "fileperms", "proc_open", "popen", "shell_exec",
+    "system", "exec", "passthru", "eval", "assert", "create_function", "call_user_func", "gzinflate", "str_rot13",
+    "hex2bin", "curl_exec", "fsockopen", "symlink", "set_time_limit", "ini_set",
+];
+fn hex_name_table(t: &str) -> Option<usize> {
+    let mut seen: Vec<String> = Vec::new();
+    for c in HEX_LIT.captures_iter(t) {
+        let h = &c[1];
+        if h.bytes().all(|b| b.is_ascii_digit()) {
+            continue; // plain numbers
+        }
+        let Some(b) = (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).ok()).collect::<Option<Vec<u8>>>() else { continue };
+        if let Ok(name) = std::str::from_utf8(&b) {
+            let n = name.trim_end_matches("();").trim_end_matches("()").to_ascii_lowercase();
+            if HEX_TABLE_NAMES.contains(&n.as_str()) && !seen.contains(&n) {
+                seen.push(n);
+            }
+        }
+    }
+    (seen.len() >= 3).then_some(seen.len())
+}
+// s1.php: eval('?>'.$output) where $output came from curl_exec($_GET['url']). The '?>' tag swap
+// alone is an old templating idiom (CodeIgniter short-tag rewrite), so require a fetch in the file.
+static EVAL_TAGSWAP: LazyLock<Regex> = LazyLock::new(|| rx(r#"(?i)\beval\s*\(\s*['"]\?>['"]\s*\."#));
+static FETCH_REMOTE: LazyLock<Regex> = LazyLock::new(|| {
+    rx(r#"(?i)\bcurl_exec\s*\(|\bfile_get_contents\s*\(\s*['"]https?://|\bfile_get_contents\s*\(\s*\$_(?:GET|POST|REQUEST)|\bfsockopen\s*\("#)
+});
 // B11 - goto packer. Counting DISTINCT targets is the discriminator: honest code jumps many
 // sites to few labels (corpus-wide legit max = 2 distinct), packers pair them 1:1. Labels are
 // matched unanchored because yakpro-po's default strip_indentation emits the file on one line.
@@ -864,6 +927,10 @@ struct Verdict {
     level: &'static str,
     score: i64,
     reasons: Vec<String>,
+    /// (points, rule) for every rule that fired, in firing order - the score is their sum
+    parts: Vec<(i64, String)>,
+    /// up to 4 (line number, snippet) lines holding a sink / decoder / superglobal (only with metrics)
+    evidence: Vec<(usize, String)>,
     metrics: serde_json::Value,
 }
 
@@ -917,7 +984,10 @@ fn verdict(path: &str, want_metrics: bool) -> Option<Verdict> {
     let t: &str = &text;
     let f = features(&raw, t, want_metrics);
 
-    if !PHP_GATE.is_match(head(t, 4096)) && !PHP_GATE.is_match(tail(t, 2048)) {
+    // a polyglot's first tag can sit past the 4 KB head window (chonburi.imm foxx.php: JPEG
+    // header, tag at byte 6706), so the binary-prefix test is its own way through the gate
+    let poly = binary_prefix(&raw);
+    if poly.is_none() && !PHP_GATE.is_match(head(t, 4096)) && !PHP_GATE.is_match(tail(t, 2048)) {
         return None; // not PHP at all
     }
 
@@ -931,10 +1001,13 @@ fn verdict(path: &str, want_metrics: bool) -> Option<Verdict> {
 
     let mut score: i64 = 0;
     let mut reasons: Vec<String> = Vec::new();
+    let mut parts: Vec<(i64, String)> = Vec::new();
     macro_rules! add {
         ($pts:expr, $why:expr) => {{
+            let why = ($why).to_string();
             score += $pts;
-            reasons.push(format!("{} (+{})", $why, $pts));
+            reasons.push(format!("{} (+{})", why, $pts));
+            parts.push(($pts, why));
         }};
     }
 
@@ -950,6 +1023,22 @@ fn verdict(path: &str, want_metrics: bool) -> Option<Verdict> {
         }
     } else if tempnam_dropper(t) {
         add!(100, "tempnam() staging into a temp dir off a superglobal (Family-K)");
+    }
+
+    match poly {
+        // no honest .php in a web tree starts with an image/archive signature
+        Some((k, true)) => add!(100, format!("PHP code inside an image/archive file (polyglot, tag at byte {k})")),
+        Some((k, false)) => add!(60, format!("PHP code hidden behind a binary header (polyglot, tag at byte {k})")),
+        None => {}
+    }
+    if let Some(n) = hex_name_table(t) {
+        add!(100, format!("function-name table hidden as hex strings ({n} dangerous names)"));
+    }
+    if EVAL_TAGSWAP.is_match(t) && FETCH_REMOTE.is_match(t) {
+        add!(100, "fetched content executed with eval('?>'.…) (remote code loader)");
+    }
+    if RAW_NAME_UPLOAD.is_match(t) {
+        add!(60, "upload saved under the client-supplied file name ($_FILES name)");
     }
 
     if COOKIE_ARITH.is_match(t) {
@@ -1034,6 +1123,15 @@ fn verdict(path: &str, want_metrics: bool) -> Option<Verdict> {
     }
     if let Some(name) = reassembled_sink(t) {
         add!(80, format!("sink name assembled from string literals ({name})"));
+    } else if let Some(name) = folded_sink(t) {
+        // a hidden EXECUTION sink is a verdict; a hidden decoder name is also how WP Rocket
+        // ('gz' . strrev('etalfni')) and laced free templates ship, so it is review-grade alone
+        let exec = ["eval", "assert", "system", "exec", "shell_exec", "passthru", "popen", "proc_open", "pcntl_exec", "create_function", "call_user_func", "call_user_func_array", "move_uploaded_file", "file_put_contents", "ffi"];
+        if exec.contains(&name.as_str()) {
+            add!(100, format!("execution sink name built by string transforms ({name})"));
+        } else {
+            add!(60, format!("decoder name built by string transforms ({name})"));
+        }
     }
     // The carrier alone is never a verdict: it needs its reader or a decoder alongside.
     if ws_mixed_run(t) >= 200 {
@@ -1105,6 +1203,8 @@ fn verdict(path: &str, want_metrics: bool) -> Option<Verdict> {
             level: level_of(score),
             score,
             reasons,
+            evidence: if want_metrics && score > 0 { evidence(t) } else { Vec::new() },
+            parts,
             metrics: metrics(&f),
         });
     }
@@ -1158,15 +1258,66 @@ fn verdict(path: &str, want_metrics: bool) -> Option<Verdict> {
         level: level_of(score),
         score,
         reasons,
+        evidence: if want_metrics && score > 0 { evidence(t) } else { Vec::new() },
+        parts,
         metrics: metrics(&f),
     })
+}
+
+// ---------------------------------------------------------------- explain
+
+static EVIDENCE: LazyLock<Regex> = LazyLock::new(|| {
+    rx(r"(?i)(?:^|[^\w$>:])(?:eval|assert|system|exec|shell_exec|passthru|popen|proc_open|pcntl_exec|create_function|call_user_func(?:_array)?|move_uploaded_file|copy|file_put_contents|fwrite|base64_decode|gzinflate|gzuncompress|gzdecode|str_rot13|hex2bin|openssl_decrypt|curl_exec|file_get_contents|fsockopen|include|require|include_once|require_once)\s*\(|\$_(?:GET|POST|REQUEST|COOKIE|FILES|SERVER)\b")
+});
+
+/// Up to 4 lines that carry a sink / decoder / superglobal, as (line number, ~110-char window
+/// around the first hit). Comment-only lines are skipped; control bytes (polyglot headers) dropped.
+fn evidence(t: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (i, line) in t.lines().enumerate() {
+        let l = line.trim_start();
+        if l.starts_with("//") || l.starts_with('*') || l.starts_with('#') || l.starts_with("/*") {
+            continue;
+        }
+        let Some(m) = EVIDENCE.find(line) else { continue };
+        let mut a = m.start().saturating_sub(30);
+        while !line.is_char_boundary(a) { a -= 1; }
+        let s: String = line[a..].chars().filter(|c| !c.is_control() || *c == '\t').take(110).collect();
+        let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        // a polyglot's binary header decodes to U+FFFD soup - not evidence anyone can read
+        if s.is_empty() || s.chars().filter(|&c| c == '\u{FFFD}').count() > 3 { continue; }
+        out.push((i + 1, format!("{}{}", if a > 0 { "…" } else { "" }, s)));
+        if out.len() >= 4 { break; }
+    }
+    out
+}
+
+fn explain(v: &Verdict) -> String {
+    let mut s = format!(
+        "── {} score {}  (CRITICAL≥100 SUSPECT≥60 WARN≥30)\nfile: {}\n",
+        v.level, v.score, v.file
+    );
+    for (pts, why) in &v.parts {
+        s += &format!("  {:>+4}  {}\n", pts, why);
+    }
+    if v.parts.is_empty() {
+        s += "  (no rule fired)\n";
+    }
+    for (n, line) in &v.evidence {
+        s += &format!("  L{}: {}\n", n, line);
+    }
+    if let serde_json::Value::Object(m) = &v.metrics {
+        let kv: Vec<String> = m.iter().map(|(k, x)| format!("{k}={x}")).collect();
+        s += &format!("  metrics: {}\n", kv.join(" "));
+    }
+    s
 }
 
 // ---------------------------------------------------------------- main
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let (mut as_json, mut show_all, mut from_stdin) = (false, false, false);
+    let (mut as_json, mut show_all, mut from_stdin, mut as_explain) = (false, false, false, false);
     let mut paths: Vec<String> = Vec::new();
     let mut threads: Option<usize> = None;
 
@@ -1177,6 +1328,7 @@ fn main() {
         match a.as_str() {
             "--json" => as_json = true,
             "--all" => show_all = true,
+            "--explain" => as_explain = true,
             "--stdin" => from_stdin = true,
             "--threads" => threads = it.next().and_then(|s| s.parse::<usize>().ok()),
             other if other.starts_with("--") => {} // ignore unknown flags
@@ -1202,7 +1354,7 @@ fn main() {
     }
 
     // Order-preserving parallel scan.
-    let results: Vec<Option<Verdict>> = paths.par_iter().map(|p| verdict(p, as_json)).collect();
+    let results: Vec<Option<Verdict>> = paths.par_iter().map(|p| verdict(p, as_json || as_explain)).collect();
 
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
@@ -1213,9 +1365,15 @@ fn main() {
                 "level": v.level,
                 "score": v.score,
                 "reasons": v.reasons,
+                "breakdown": v.parts.iter().map(|(p, w)| serde_json::json!({"points": p, "rule": w})).collect::<Vec<_>>(),
+                "evidence": v.evidence.iter().map(|(n, l)| serde_json::json!({"line": n, "text": l})).collect::<Vec<_>>(),
                 "metrics": v.metrics,
             });
             let _ = writeln!(out, "{obj}");
+        } else if as_explain {
+            if show_all || v.level != "CLEAN" {
+                let _ = write!(out, "{}", explain(&v));
+            }
         } else if show_all || v.level != "CLEAN" {
             let shown: Vec<&str> = v.reasons.iter().take(3).map(|s| s.as_str()).collect();
             let _ = writeln!(out, "{:<8} {:>4}  {} :: {}", v.level, v.score, v.file, shown.join("; "));

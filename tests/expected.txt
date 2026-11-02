@@ -1,0 +1,11 @@
+# fixture                       minimum level
+bad/a_strrev.php                CRITICAL
+bad/b_hexesc.php                CRITICAL
+bad/c_rot13.php                 CRITICAL
+bad/d_chr.php                   CRITICAL
+bad/e_b64.php                   CRITICAL
+bad/f_hex2bin.php               CRITICAL
+bad/g_mixed.php                 CRITICAL
+bad/h_octal.php                 CRITICAL
+bad/i_nested.php                SUSPECT
+clean/plain.php                 CLEAN
